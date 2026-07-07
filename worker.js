@@ -741,6 +741,13 @@ export default {
     const path = url.pathname;
 
     if (path === '/favicon.ico') return new Response(null, { status: 204 });
+    // One-time password reset (temporary; removed on next push). Only works with the
+    // exact secret key below, so no stranger can trigger it. Clears the saved
+    // password so the owner can set a fresh one on the first-run screen.
+    if (path === '/reset-pw-7Kq2mZ') {
+      if (env.TOKENS) { await env.TOKENS.delete('sys:passcode_hash'); }
+      return new Response('Password cleared. Now open your dashboard home page and set a new password.', { status: 200, headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } });
+    }
     if (path === '/api/login' && request.method === 'POST') return apiLogin(env, request);
     if (path === '/api/setup' && request.method === 'POST') return apiSetup(env, request);
     if (path === '/api/logout' && request.method === 'POST') return apiLogout();
