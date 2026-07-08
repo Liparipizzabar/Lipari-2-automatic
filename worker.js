@@ -175,12 +175,23 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    manual: true,
+    async status(env, h) {
+      const last = await lastSync(env, 'pos');
+      return { connected: !!last, org: last ? 'Entered by you' : null, sandbox: false, lastSync: last };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) throw new NotConfigured('pos');
+      return { count: r.sums.count || 0 };
+    },
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: m.months, count: m.byMonth.map((s) => (s && typeof s.count === 'number') ? s.count : null) };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -719,6 +730,38 @@ async function apiIngest(env, request, url) {
   }
 }
 
+/* POST /api/pos-manual  (logged-in owner only)
+   Body: { from:'YYYY-MM-DD', to:'YYYY-MM-DD', count:Number }
+   Spreads the transaction count evenly across the days in the range and saves
+   it to the POS day-store, so the Transactions + Average Spend cards light up.
+   Re-entering the same range overwrites (safe to correct). */
+async function apiPosManual(env, request) {
+  let body;
+  try { body = await request.json(); } catch (e) { return json({ error: 'bad_json' }, 400); }
+  const from = String(body.from || '');
+  const to = String(body.to || '');
+  const count = Number(body.count);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return json({ error: 'bad_dates', plain: 'Enter valid from and to dates (YYYY-MM-DD).' }, 400);
+  }
+  if (!isFinite(count) || count < 0) {
+    return json({ error: 'bad_count', plain: 'Enter the transaction count as a whole number.' }, 400);
+  }
+  const days = eachDate(from, to);
+  if (days.length === 0) return json({ error: 'empty_range' }, 400);
+  /* Spread evenly; distribute remainder across the first days so the total is exact. */
+  const base = Math.floor(count / days.length);
+  let remainder = count - base * days.length;
+  const rows = days.map((date) => {
+    let c = base;
+    if (remainder > 0) { c += 1; remainder -= 1; }
+    return { date, count: c };
+  });
+  const saved = await saveIngestedRows(env, 'pos', rows);
+  await noteSync(env, 'pos');
+  return json({ ok: true, days: saved, total: count });
+}
+
 /* ---------------- Metrics API ---------------- */
 
 function parseRange(s) {
@@ -888,6 +931,10 @@ export default {
     if (path === '/api/setup' && request.method === 'POST') return apiSetup(env, request);
     if (path === '/api/logout' && request.method === 'POST') return apiLogout();
     if (path === '/api/ingest' && request.method === 'POST') return apiIngest(env, request, url);
+    if (path === '/api/pos-manual' && request.method === 'POST') {
+      if (!(await isLoggedIn(request, env))) return json({ error: 'auth' }, 401);
+      return apiPosManual(env, request);
+    }
 
     const loggedIn = await isLoggedIn(request, env);
 
