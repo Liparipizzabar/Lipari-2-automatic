@@ -84,7 +84,7 @@ const ADAPTERS = {
     oauth: {
       authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
       tokenUrl: 'https://identity.xero.com/connect/token',
-      scopes: 'offline_access accounting.reports.profitandloss.read',
+      scopes: 'openid profile email offline_access accounting.reports.read',
       clientIdSecret: 'ACCOUNTING_CLIENT_ID',
       clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
       tokenAuth: 'basic'   /* Xero's token endpoint wants HTTP Basic client auth */
