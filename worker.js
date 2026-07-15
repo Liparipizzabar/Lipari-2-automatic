@@ -628,6 +628,18 @@ async function authCallback(env, source, url) {
     return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
   }
   const t = await res.json();
+  /* DIAGNOSTIC (2026-07-14): record what the provider returned at connect time -
+     specifically whether a refresh_token came back. No secrets are stored here,
+     only booleans and lengths, so this is safe to keep briefly. */
+  try {
+    await env.TOKENS.put('diag:' + source + ':last_connect', JSON.stringify({
+      when: new Date().toISOString(),
+      got_access_token: !!t.access_token,
+      got_refresh_token: !!t.refresh_token,
+      scope_returned: t.scope || null,
+      expires_in: t.expires_in || null
+    }));
+  } catch (e) { /* diagnostics must never break the connect flow */ }
   await saveTokens(env, source, {
     access_token: t.access_token,
     refresh_token: t.refresh_token || null,
@@ -791,6 +803,22 @@ async function sourceStatus(env, source) {
       error: null
     };
   } catch (err) {
+    /* DIAGNOSTIC (2026-07-14): record the real reason so we can see WHY the
+       connection drops instead of guessing. Also record whether a refresh
+       token is even present - a missing refresh token is the prime suspect. */
+    try {
+      const tk = await getTokens(env, source);
+      await env.TOKENS.put('diag:' + source + ':last_error', JSON.stringify({
+        when: new Date().toISOString(),
+        message: String(err && err.message || err),
+        status: err && err.status || null,
+        has_tokens: !!tk,
+        has_access_token: !!(tk && tk.access_token),
+        has_refresh_token: !!(tk && tk.refresh_token),
+        expires_at: tk && tk.expires_at || null,
+        expired: tk && tk.expires_at ? (Date.now() > tk.expires_at) : null
+      }));
+    } catch (e) { /* never let diagnostics break the response */ }
     return {
       configured: true,
       ingest: typeof adapter.parseExport === 'function',
@@ -934,6 +962,15 @@ export default {
     if (path === '/api/pos-manual' && request.method === 'POST') {
       if (!(await isLoggedIn(request, env))) return json({ error: 'auth' }, 401);
       return apiPosManual(env, request);
+    }
+    if (path === '/diag' ) {
+      if (!(await isLoggedIn(request, env))) return new Response('Please log in to the dashboard first, then reload this page.', { status: 401, headers: { 'Content-Type': 'text/plain' } });
+      const out = {};
+      for (const k of ['accounting:last_connect', 'accounting:last_error']) {
+        const raw = await env.TOKENS.get('diag:' + k);
+        out[k] = raw ? JSON.parse(raw) : null;
+      }
+      return new Response(JSON.stringify(out, null, 2), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
     }
 
     const loggedIn = await isLoggedIn(request, env);
