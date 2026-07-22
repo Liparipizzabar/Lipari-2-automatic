@@ -364,6 +364,20 @@ async function getValidAccessToken(env, source) {
     refresh_token: tokens.refresh_token
   }, env));
   if (!res.ok) {
+    /* DIAGNOSTIC (2026-07-22): capture what the provider actually said. This is
+       the message that names the real cause (e.g. invalid_grant = refresh token
+       already used/expired). Without it we are guessing. */
+    let bodyText = '';
+    try { bodyText = (await res.text()).slice(0, 500); } catch (e) {}
+    try {
+      await env.TOKENS.put('diag:' + source + ':last_refresh_fail', JSON.stringify({
+        when: new Date().toISOString(),
+        http_status: res.status,
+        provider_said: bodyText,
+        had_refresh_token: !!tokens.refresh_token,
+        token_obtained_at: tokens.obtained_at || null
+      }));
+    } catch (e) {}
     /* refresh failed: force a reconnect rather than silently serving stale data */
     const e = new Error('refresh failed'); e.status = 401; throw e;
   }
@@ -843,6 +857,21 @@ async function fetchSlot(env, q) {
       await noteSync(env, source);
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
+      /* DIAGNOSTIC (2026-07-22): this catch was silently swallowing the real
+         reason the cards go blank. Record it so it can be seen at /diag. */
+      try {
+        const tk = await getTokens(env, source);
+        await env.TOKENS.put('diag:' + source + ':last_fetch_error', JSON.stringify({
+          when: new Date().toISOString(),
+          range: (q && q.from ? q.from + '..' + q.to : (q && q.fromMonth ? q.fromMonth + '..' + q.toMonth : null)),
+          message: String(err && err.message || err),
+          status: (err && err.status) || null,
+          has_tokens: !!tk,
+          has_refresh_token: !!(tk && tk.refresh_token),
+          token_expires_at: (tk && tk.expires_at) || null,
+          token_expired: (tk && tk.expires_at) ? (Date.now() > tk.expires_at) : null
+        }));
+      } catch (e) { /* diagnostics must never break the payload */ }
     }
   }
   return out;
@@ -966,7 +995,7 @@ export default {
     if (path === '/diag' ) {
       if (!(await isLoggedIn(request, env))) return new Response('Please log in to the dashboard first, then reload this page.', { status: 401, headers: { 'Content-Type': 'text/plain' } });
       const out = {};
-      for (const k of ['accounting:last_connect', 'accounting:last_error']) {
+      for (const k of ['accounting:last_connect', 'accounting:last_error', 'accounting:last_fetch_error', 'accounting:last_refresh_fail']) {
         const raw = await env.TOKENS.get('diag:' + k);
         out[k] = raw ? JSON.parse(raw) : null;
       }
