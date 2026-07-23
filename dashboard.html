@@ -898,6 +898,17 @@ function metricCard(key, cur, prev, yoy, r) {
   var ready = def.needs.every(isConfigured);
   var card = el('div', 'mcard fade-in');
 
+  /* UX (2026-07-22): before the first payload arrives state.data is null, so every
+     source looked "not configured" and the board briefly claimed Xero wasn't
+     connected. While loading with no data yet, show a neutral loading card
+     instead of asserting something we don't know. */
+  if (state.loading && state.data == null) {
+    card.appendChild(el('div', 'm-label', esc(def.label)));
+    card.appendChild(el('div', 'm-value dim', '…'));
+    card.appendChild(el('div', 'notconf-msg', 'Loading your numbers…'));
+    return card;
+  }
+
   if (!ready) {
     card.className += ' not-conf';
     card.appendChild(el('div', 'm-label', esc(def.label)));
@@ -921,7 +932,11 @@ function metricCard(key, cur, prev, yoy, r) {
   card.appendChild(el('div', 'm-label', esc(def.label)));
 
   var v = metricValue(key, cur);
-  if (state.loading && state.data == null) {
+  /* UX (2026-07-22): previously this only showed the placeholder when there was
+     no data at all, so switching periods rendered the PREVIOUS period's numbers
+     until the new ones arrived. Show the placeholder whenever a fetch is in
+     flight, so a figure on screen always belongs to the period in the heading. */
+  if (state.loading) {
     card.appendChild(el('div', 'm-value dim', '…'));
   } else {
     card.appendChild(headline(key, cur, v));
