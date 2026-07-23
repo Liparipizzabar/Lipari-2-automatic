@@ -923,9 +923,10 @@ async function apiMetrics(env, url) {
   ].join('|');
   const force = url.searchParams.get('refresh') === '1';
   let data = null;
+  let servedFromCache = false;
   if (!force && env.TOKENS) {
     const cached = await env.TOKENS.get(cacheKey);
-    if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
+    if (cached) { try { data = JSON.parse(cached); servedFromCache = true; } catch (e) { data = null; } }
   }
   if (!data) {
     /* PERF (2026-07-22): the three periods were awaited one after another and the
@@ -964,6 +965,15 @@ async function apiMetrics(env, url) {
   return json({
     generatedAt: data.generatedAt,
     protected: true,
+    /* DIAGNOSTIC (2026-07-22): surface which cache entry served this response and
+       the exact ranges requested, so "different period, same numbers" can be
+       diagnosed from the response itself rather than guessed at. */
+    _debug: {
+      servedFromCache: servedFromCache,
+      cacheKey: cacheKey,
+      requestedCur: url.searchParams.get('cur') || null,
+      requestedPrev: url.searchParams.get('prev') || null
+    },
     sources: { accounting: sAcc, pos: sPos, rostering: sRos },
     periods: data.periods,
     trend: data.trend

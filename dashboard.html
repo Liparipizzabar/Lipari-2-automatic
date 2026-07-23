@@ -556,7 +556,7 @@ function fetchData(force) {
   }
   state.loading = true; state.fetchError = null;
   render();
-  fetch(apiUrl(force)).then(function (res) {
+  fetch(apiUrl(force), { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }).then(function (res) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return res.json();
   }).then(function (json) {
