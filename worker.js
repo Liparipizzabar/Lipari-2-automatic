@@ -349,6 +349,13 @@ function tokenRequestInit(cfg, params, env) {
 
 /* Returns a valid access token for an OAuth source, refreshing (and
    persisting the ROTATED refresh token) when needed. */
+/* PERF/SAFETY (2026-07-22): with several provider calls now running in parallel,
+   an expired token could trigger several simultaneous refreshes. Xero invalidates
+   the old refresh token the moment one succeeds, so the losers of that race would
+   fail and drop the connection. This map lets concurrent callers share a single
+   in-flight refresh instead of each starting their own. */
+const REFRESH_IN_FLIGHT = new Map();
+
 async function getValidAccessToken(env, source) {
   const adapter = ADAPTERS[source];
   const tokens = await getTokens(env, source);
@@ -356,7 +363,16 @@ async function getValidAccessToken(env, source) {
   const skewMs = 60 * 1000;
   if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
 
-  /* refresh */
+  const existing = REFRESH_IN_FLIGHT.get(source);
+  if (existing) return existing;
+  const p = (async () => doRefresh(env, source, tokens))()
+    .finally(() => { REFRESH_IN_FLIGHT.delete(source); });
+  REFRESH_IN_FLIGHT.set(source, p);
+  return p;
+}
+
+async function doRefresh(env, source, tokens) {
+  const adapter = ADAPTERS[source];
   const cfg = adapter.oauth || {};
   if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
   const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
@@ -912,24 +928,33 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
-    const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
-
-    let trendOut = null;
-    if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+    /* PERF (2026-07-22): the three periods were awaited one after another and the
+       trend after those, so a page load made 4+ sequential Xero round-trips.
+       Running them all together cuts the wait to roughly the slowest single call. */
+    async function buildTrend() {
+      if (!trend) return null;
+      const out = { months: monthList(trend.fromMonth, trend.toMonth) };
+      const jobs = ['accounting', 'pos'].map(async (source) => {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) { out[source] = null; return; }
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
-      }
+          out[source] = alignSeries(out.months, series);
+        } catch (err) { out[source] = null; }
+      });
+      await Promise.all(jobs);
+      return out;
     }
+
+    const [curOut, prevOut, yoyOut, trendOut] = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null),
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null),
+      buildTrend()
+    ]);
+    const periods = { cur: curOut, prev: prevOut, yoy: yoyOut };
+
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
     if (env.TOKENS) {
       try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
