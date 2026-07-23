@@ -861,6 +861,30 @@ async function sourceStatus(env, source) {
   }
 }
 
+/* PERF (2026-07-22): cache each range independently rather than only caching the
+   whole three-range combination. The prev/yoy comparison windows are settled
+   history and are shared across page loads, so caching them separately turns
+   most "This week" loads into a single live call for the current week only. */
+async function fetchSlotCached(env, q, rangeKeyStr, tz, rollover, force) {
+  if (!env.TOKENS || !rangeKeyStr) return fetchSlot(env, q);
+  const key = 'slotcache:' + rangeKeyStr + '|' + tz + '|' + rollover;
+  if (!force) {
+    try {
+      const hit = await env.TOKENS.get(key);
+      if (hit) return JSON.parse(hit);
+    } catch (e) { /* fall through to a live fetch */ }
+  }
+  const out = await fetchSlot(env, q);
+  /* Only cache a slot that actually returned something, so a transient failure
+     is never remembered as "no data" for the next half hour. */
+  const worthCaching = out && Object.keys(out).some((k) => out[k] != null);
+  if (worthCaching) {
+    const ttl = rangeEndsInPast(rangeKeyStr) ? METRICS_CACHE_TTL_SETTLED : METRICS_CACHE_TTL;
+    try { await env.TOKENS.put(key, JSON.stringify(out), { expirationTtl: ttl }); } catch (e) {}
+  }
+  return out;
+}
+
 async function fetchSlot(env, q) {
   /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
@@ -894,6 +918,23 @@ async function fetchSlot(env, q) {
 }
 
 const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
+/* PERF (2026-07-22): a range that ended before today can no longer change (bar
+   bookkeeper edits), so caching it for two minutes wastes most of its value.
+   "This week" is hit hardest: it asks for three ranges including an odd
+   364-days-back comparison window that is almost always a cold fetch. Cache
+   ranges that have already ended for much longer, while keeping any range that
+   includes today short-lived so current figures stay fresh. */
+const METRICS_CACHE_TTL_SETTLED = 1800; /* 30 min for ranges that ended in the past */
+
+function rangeEndsInPast(curParam) {
+  if (!curParam) return false;
+  const parts = String(curParam).split(':');
+  if (parts.length !== 2) return false;
+  const end = parts[1];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(end)) return false;
+  const todayIso = new Date().toISOString().slice(0, 10);
+  return end < todayIso;
+}
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -934,6 +975,16 @@ async function apiMetrics(env, url) {
        Running them all together cuts the wait to roughly the slowest single call. */
     async function buildTrend() {
       if (!trend) return null;
+      /* PERF (2026-07-22): the trend spans 24 months of mostly settled history and
+         was refetched on every cold load. Cache it on its own key so it is shared
+         across periods and page loads. */
+      const trendKey = 'trendcache:' + (url.searchParams.get('trend') || '') + '|' + tz + '|' + rollover;
+      if (!force && env.TOKENS) {
+        try {
+          const hit = await env.TOKENS.get(trendKey);
+          if (hit) return JSON.parse(hit);
+        } catch (e) { /* fall through */ }
+      }
       const out = { months: monthList(trend.fromMonth, trend.toMonth) };
       const jobs = ['accounting', 'pos'].map(async (source) => {
         const adapter = ADAPTERS[source];
@@ -945,13 +996,16 @@ async function apiMetrics(env, url) {
         } catch (err) { out[source] = null; }
       });
       await Promise.all(jobs);
+      if (env.TOKENS && out.accounting) {
+        try { await env.TOKENS.put(trendKey, JSON.stringify(out), { expirationTtl: METRICS_CACHE_TTL_SETTLED }); } catch (e) {}
+      }
       return out;
     }
 
     const [curOut, prevOut, yoyOut, trendOut] = await Promise.all([
-      fetchSlot(env, { ...base, ...cur }),
-      prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null),
-      yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null),
+      fetchSlotCached(env, { ...base, ...cur }, url.searchParams.get('cur'), tz, rollover, force),
+      prev ? fetchSlotCached(env, { ...base, ...prev }, url.searchParams.get('prev'), tz, rollover, force) : Promise.resolve(null),
+      yoy ? fetchSlotCached(env, { ...base, ...yoy }, url.searchParams.get('yoy'), tz, rollover, force) : Promise.resolve(null),
       buildTrend()
     ]);
     const periods = { cur: curOut, prev: prevOut, yoy: yoyOut };
